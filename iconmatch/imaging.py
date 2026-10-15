@@ -78,6 +78,16 @@ def largest_component(mask: np.ndarray, max_side: int = 192) -> Blob | None:
     return max(blobs, key=lambda b: b.area) if blobs else None
 
 
+def largest_blob(img: Image.Image) -> Blob | None:
+    """The biggest thing in `img` that is not background, or None if there is none.
+
+    The segmentation :func:`normalize` runs, on its own, so a caller can ask
+    "is there an icon in this picture at all?" before deciding to crop it.
+    """
+    arr = np.asarray(to_rgb(img))
+    return largest_component(_clean(foreground_mask(arr, estimate_background(arr))))
+
+
 def find_blobs(mask: np.ndarray, max_side: int = 192) -> list[Blob]:
     """Every 8-connected blob of the mask, in full-resolution coordinates."""
     h, w = mask.shape

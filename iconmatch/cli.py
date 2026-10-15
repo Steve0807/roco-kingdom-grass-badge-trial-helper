@@ -1,10 +1,12 @@
 """Headless companion to the GUI: work with image files instead of the clipboard.
 
     python -m iconmatch.cli list
-    python -m iconmatch.cli match --db 1 shot.png
-    python -m iconmatch.cli add   --db 1 shot.png --name Pikachu
-    python -m iconmatch.cli add   --db 1 folder/*.png --force
-    python -m iconmatch.cli add   --db 1 grid_screenshot.png   # split automatically
+    python -m iconmatch.cli match  --db 1 shot.png
+    python -m iconmatch.cli scan   --db 1 screen.png             # what the watcher sees
+    python -m iconmatch.cli scan   --db 1 screen.png --fight 2   # ...and store one
+    python -m iconmatch.cli add    --db 1 shot.png --name Pikachu
+    python -m iconmatch.cli add    --db 1 folder/*.png --force
+    python -m iconmatch.cli add    --db 1 grid_screenshot.png   # split automatically
     python -m iconmatch.cli remove --db 1 0003
 
 Messages follow the language set with --lang (Simplified Chinese by default).
@@ -12,14 +14,28 @@ Messages follow the language set with --lang (Simplified Chinese by default).
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 from PIL import Image
 
-from . import i18n, imaging
+from . import i18n, imaging, watcher
 from .database import DEFAULT_ROOT, IconDB, list_dbs
 from .i18n import t
+
+
+def _indexes(raw: str) -> list[int]:
+    """The --fight list ("1,3" or "1 3") as 1-based numbers."""
+    out = []
+    for part in re.split(r"[,\s]+", raw.strip()):
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            raise SystemExit(t("cli.fight_bad", value=part))
+    return out
 
 
 def _open_or_create(root: Path, db_id: int, create: bool) -> IconDB:
@@ -59,6 +75,11 @@ def main(argv=None) -> int:
     p.add_argument("files", nargs="+", type=Path)
     p.add_argument("--top", type=int, default=3)
 
+    p = sub.add_parser("scan", help=t("cli.help.scan"))
+    p.add_argument("--db", type=int, required=True)
+    p.add_argument("files", nargs="+", type=Path)
+    p.add_argument("--fight", default="", help=t("cli.help.fight"))
+
     p = sub.add_parser("add", help=t("cli.help.add"))
     p.add_argument("--db", type=int, required=True)
     p.add_argument("files", nargs="+", type=Path)
@@ -93,6 +114,26 @@ def main(argv=None) -> int:
             print(t("cli.match_row", file=f, verdict=verdict, id=found.best.id,
                     name=found.best.name, sim=found.similarity,
                     rel=found.confidence, extra=extra))
+        return 0
+
+    if args.cmd == "scan":
+        # exactly what the live watcher does with a frame, minus the screen:
+        # useful for dry-running a region against a screenshot you already have
+        db = _open_or_create(args.root, args.db, create=False)
+        for f in args.files:
+            detections = watcher.scan(db, Image.open(f))
+            if not detections:
+                print(t("cli.scan_empty", file=f))
+                continue
+            fresh = sum(1 for d in detections if d.state == watcher.NEW)
+            print(t("cli.scan_head", file=f, total=len(detections), new=fresh))
+            for n, det in enumerate(detections, 1):
+                print(t("cli.scan_row", index=n, state=watcher.state_label(det.state),
+                        detail=watcher.detail_line(det)))
+            for index in _indexes(args.fight):
+                if 1 <= index <= len(detections):
+                    icon = detections[index - 1].record(db, "")
+                    print(t("cli.fought", index=index, id=icon.id, name=icon.name))
         return 0
 
     if args.cmd == "add":

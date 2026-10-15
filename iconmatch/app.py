@@ -1,4 +1,9 @@
-"""Tkinter front end: pick a database, match a clipboard icon, grow the database.
+"""Tkinter front end: pick a database, watch the game, grow the database.
+
+Two ways in, one database below both: the live watcher re-photographs a region
+of the screen the player framed and lists every icon in it (see
+:mod:`iconmatch.watcher`), while the clipboard route still handles a single
+hand-cropped icon.
 
 Every visible string comes from :mod:`iconmatch.i18n`; the Language menu
 redraws the window in place.
@@ -14,12 +19,17 @@ from tkinter import messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
-from . import clipboard, config, i18n, imaging
-from .database import DEFAULT_ROOT, IconDB, list_dbs
+from . import battle, clipboard, config, i18n, imaging, settings, watcher
+from .database import DEFAULT_ROOT, Icon, IconDB, list_dbs
 from .i18n import t
+from .watcher import Region, ScreenWatcher
 
 PANEL = 260
 CANDIDATES = 10          # rows shown in the Candidates tab after a Ctrl+V check
+PAIR_THUMB = 48          # the size of the two pictures a Match row puts side by side
+ROW_BG = "#fafafa"       # background of those rows when nothing is wrong with them
+BADGE_W = 112            # the status badge's box, wide enough for its longest text
+BADGE_H = 34
 
 
 def ui_font() -> str:
@@ -170,8 +180,124 @@ class SimilarIconDialog(tk.Toplevel):
 
 def _modal(dialog: tk.Toplevel):
     dialog.update_idletasks()
-    dialog.grab_set()
+    try:
+        dialog.grab_set()
+    except tk.TclError:                  # already gone (the picker can close on click)
+        pass
     dialog.wait_window()
+
+
+class ReviewDialog(tk.Toplevel):
+    """The spirit on screen and the closest stored icon, big, side by side.
+
+    A row that says "looks similar" is a question, and the answer is easier by
+    eye than by score - all the more so because the game prints the spirit's
+    element badge over the portrait's lower left, which costs a little
+    similarity.  Nothing is changed from here; the row's own buttons do that.
+    """
+
+    def __init__(self, master, det):
+        super().__init__(master)
+        self.title(t("review.title"))
+        self.transient(master)
+        self.resizable(False, False)
+        self._photos = []
+
+        best = det.best
+        headline = t("review.headline",
+                     sim=det.similarity if best is not None else 0.0,
+                     rel=det.confidence if best is not None else 0.0)
+        ttk.Label(self, text=headline, font=(ui_font(), 11, "bold")).pack(
+            padx=14, pady=(14, 2))
+        ttk.Label(self, text=t("review.sub"), foreground="#555",
+                  justify="left").pack(padx=14)
+
+        pair = [(t("review.screen"), det.tile)]
+        if best is not None:
+            pair.append((t("review.stored", id=best.id), best.tile))
+        row_frame = ttk.Frame(self)
+        row_frame.pack(padx=14, pady=12)
+        for label, tile in pair:
+            cell = ttk.Frame(row_frame)
+            cell.pack(side="left", padx=8)
+            ttk.Label(cell, text=label, font=(ui_font(), 10, "bold")).pack()
+            photo = _tile_photo(tile, 240)
+            self._photos.append(photo)
+            tk.Label(cell, image=photo, bd=1, relief="solid").pack()
+
+        ttk.Button(self, text=t("btn.close"), command=self.destroy).pack(pady=(0, 14))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+
+class RegionPicker(tk.Toplevel):
+    """A translucent overlay over every monitor: drag a box around the icons.
+
+    The rectangle comes out in physical screen pixels, the same coordinates the
+    screen grab uses - which is why :func:`watcher.enable_dpi_awareness` has to
+    have run before the window is ever opened.
+    """
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title(t("watch.region_btn"))
+        self.result: Region | None = None
+
+        x, y, w, h = watcher.virtual_screen()
+        if not w or not h:                       # not Windows: whatever Tk can see
+            x = y = 0
+            w, h = self.winfo_screenwidth(), self.winfo_screenheight()
+
+        self.overrideredirect(True)
+        watcher.place_overlay(self, x, y, w, h)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.35)      # the game stays visible underneath
+        except tk.TclError:                      # pragma: no cover - no compositor
+            pass
+
+        self.canvas = tk.Canvas(self, bg="#101010", highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.create_text(w // 2, h // 2, text=t("watch.picker_hint"), fill="#ffffff",
+                                font=(ui_font(), 18, "bold"), justify="center")
+        self._origin: tuple[int, int] | None = None
+        self._box: int | None = None
+
+        self.canvas.bind("<Button-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.focus_force()
+
+    def _press(self, event):
+        self._origin = (event.x_root, event.y_root)
+        if self._box is not None:
+            self.canvas.delete(self._box)
+        self._box = self.canvas.create_rectangle(event.x, event.y, event.x, event.y,
+                                                 outline="#4ade80", width=3)
+
+    def _drag(self, event):
+        if self._origin is None or self._box is None:
+            return
+        ox, oy = self.winfo_rootx(), self.winfo_rooty()
+        self.canvas.coords(self._box, self._origin[0] - ox, self._origin[1] - oy,
+                           event.x_root - ox, event.y_root - oy)
+
+    def _release(self, event):
+        if self._origin is None:
+            return
+        x0, y0 = self._origin
+        self._origin = None
+        region = Region(min(x0, event.x_root), min(y0, event.y_root),
+                        abs(event.x_root - x0), abs(event.y_root - y0))
+        if region.usable:                        # a small twitch is not a region
+            self.result = region
+            self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 class ScrollFrame(ttk.Frame):
@@ -475,12 +601,29 @@ class App:
         self._photo_match = None
         self._last_image: Image.Image | None = None
 
+        # live watch: what the screen showed last, and what was stored from it
+        self.watcher = ScreenWatcher()
+        self.region: Region | None = watcher.load_region()
+        self.detections: list[watcher.Detection] = []
+        self.session: list[Icon] = []
+        self._names: dict[int, str] = {}      # names typed into the Match tab's rows
+        self._defaults: dict[int, str] = {}   # the id each row suggests instead
+        self._row_entries: dict[int, ttk.Entry] = {}
+        self._row_photos: list = []
+        self._scanned = False
+        self._pump_job = None
+        self._encounter: list = []            # portraits announced the time before
+        self._offered: list[watcher.Detection] = []   # the spirits last on offer
+        self._offered_vecs = None             # ... and their descriptors
+
         root.title(t("app.title"))
         root.minsize(900, 620)
         self._build()
         self._build_menu()
         self._bind_keys()
-        root.after(80, self.choose_db)
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+        self._apply_topmost(announce=False)
+        root.after(80, self.startup)
 
     def _bind_keys(self):
         root = self.root
@@ -488,8 +631,29 @@ class App:
         root.bind("<Control-m>", lambda _e: self.do_match())
         root.bind("<Control-n>", lambda _e: self.do_add())
         root.bind("<F5>", lambda _e: self.reload())
+        root.bind("<F8>", lambda _e: self.capture_now())
         root.bind("<F1>", lambda _e: self.show_help())
         root.bind("<Control-e>", lambda _e: self.edit_db())
+
+    def startup(self):
+        """Reopen the database used last time; a session then starts with no clicks."""
+        remembered = settings.get("last_db")
+        if isinstance(remembered, int):
+            try:
+                self.open_db(IconDB.open(self.db_root, remembered))
+                self.set_status(t("status.reopened", id=self.db.id, count=len(self.db.icons)))
+            except Exception:            # deleted or unreadable -> ask as usual
+                remembered = None
+        if remembered is None:
+            self.choose_db()
+            if self.db is None:          # the chooser was closed without a database
+                return
+        if self.region is not None:      # a framed region means "I came here to play"
+            self.start_watch()
+
+    def quit(self):
+        self.stop_watch(note=False)
+        self.root.destroy()
 
     # ---------------------------------------------------------- language
     def switch_language(self, lang: str):
@@ -513,6 +677,11 @@ class App:
             self.sim_var.set(db.threshold("match_sim"))
             self.rel_var.set(db.threshold("match_rel"))
             self.refresh_db_views()
+        self._row_photos.clear()
+        self.render_detections()
+        self._update_region_label()
+        self._sync_watch_button()
+        self._apply_topmost(announce=False)
         self.set_status(t("status.language_switched"))
 
     # ------------------------------------------------------------- layout
@@ -537,6 +706,28 @@ class App:
         ttk.Spinbox(top, from_=0.0, to=1.0, increment=0.01, width=5, format="%.2f",
                     textvariable=self.sim_var, command=self._save_thresholds).pack(side="right")
         ttk.Label(top, text=t("main.sim_label")).pack(side="right", padx=(16, 6))
+
+        watch = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        watch.pack(fill="x")
+        ttk.Label(watch, text=t("watch.title"), font=(ui_font(), 10, "bold")).pack(side="left")
+        ttk.Button(watch, text=t("watch.region_btn"),
+                   command=self.pick_region).pack(side="left", padx=(6, 4))
+        self.watch_btn = ttk.Button(watch, text=t("watch.start"), command=self.toggle_watch)
+        self.watch_btn.pack(side="left", padx=4)
+        ttk.Button(watch, text=t("watch.capture_now"),
+                   command=self.capture_now).pack(side="left", padx=4)
+        self.topmost_var = tk.BooleanVar(value=bool(settings.get("topmost", True)))
+        ttk.Checkbutton(watch, text=t("watch.topmost"), variable=self.topmost_var,
+                        command=self._apply_topmost).pack(side="right")
+        self.sound_var = tk.BooleanVar(value=bool(settings.get("watch_sound", True)))
+        ttk.Checkbutton(watch, text=t("watch.sound"), variable=self.sound_var,
+                        command=self._apply_sound).pack(side="right", padx=8)
+        self.autolog_var = tk.BooleanVar(value=bool(settings.get("watch_autolog", True)))
+        ttk.Checkbutton(watch, text=t("watch.autolog"), variable=self.autolog_var,
+                        command=self._apply_autolog).pack(side="right", padx=8)
+        self.region_label = ttk.Label(watch, text="", foreground="#666")
+        self.region_label.pack(side="left", padx=12)
+        self._update_region_label()
 
         self.verdict = tk.Label(self.root, text=t("idle_hint"),
                                 font=(ui_font(), 16, "bold"), bg="#e9e9e9", fg="#333", pady=10)
@@ -587,10 +778,13 @@ class App:
         right.pack(side="left", fill="both", expand=True, padx=(14, 0))
         self.tabs = ttk.Notebook(right)
         self.tabs.pack(fill="both", expand=True)
+        self.match_tab = self._build_match_tab(self.tabs)
         self.cand_tree = self._make_tree(self.tabs, ("rank", "icon", "score"))
         self.all_tree = self._make_tree(self.tabs, ("id", "name", "added"))
+        self.tabs.add(self.match_tab, text=t("match.tab"))
         self.tabs.add(self.cand_tree.master, text=t("main.tab_candidates"))
         self.tabs.add(self.all_tree.master, text=t("main.tab_all"))
+        self.tabs.select(self.match_tab)
         self.cand_tree.bind("<<TreeviewSelect>>", self._on_candidate_select)
         self.all_tree.bind("<<TreeviewSelect>>", self._on_all_select)
 
@@ -612,6 +806,20 @@ class App:
         db_menu.add_separator()
         db_menu.add_command(label=t("menu.quit"), command=self.root.destroy)
         menubar.add_cascade(label=t("menu.database"), menu=db_menu)
+
+        watch_menu = tk.Menu(menubar, tearoff=0)
+        watch_menu.add_command(label=t("menu.pick_region"), command=self.pick_region)
+        watch_menu.add_command(label=t("menu.capture_now"), accelerator="F8",
+                               command=self.capture_now)
+        watch_menu.add_command(label=t("menu.toggle_watch"), command=self.toggle_watch)
+        watch_menu.add_separator()
+        watch_menu.add_checkbutton(label=t("menu.topmost"), variable=self.topmost_var,
+                                   command=self._apply_topmost)
+        watch_menu.add_checkbutton(label=t("menu.sound"), variable=self.sound_var,
+                                   command=self._apply_sound)
+        watch_menu.add_checkbutton(label=t("menu.autolog"), variable=self.autolog_var,
+                                   command=self._apply_autolog)
+        menubar.add_cascade(label=t("menu.watch"), menu=watch_menu)
 
         icon_menu = tk.Menu(menubar, tearoff=0)
         icon_menu.add_command(label=t("menu.check"),
@@ -645,6 +853,28 @@ class App:
     def show_help(self):
         messagebox.showinfo(t("app.title"), t("help.text"), parent=self.root)
 
+    def _build_match_tab(self, parent) -> ttk.Frame:
+        """The Match tab: one row per icon the watcher found on screen."""
+        frame = ttk.Frame(parent, padding=(8, 8, 8, 4))
+        head = ttk.Frame(frame)
+        head.pack(fill="x")
+        ttk.Button(head, text=t("match.rescan"),
+                   command=self.capture_now).pack(side="right")
+        # the summary and the hint wrap to whatever width the tab ends up with,
+        # so a long translation cannot run underneath the button beside them
+        self.match_summary = ttk.Label(frame, text="", font=(ui_font(), 10, "bold"),
+                                       justify="left", anchor="w")
+        self.match_summary.pack(fill="x")
+        self.match_hint = ttk.Label(frame, text=t("match.hint"), foreground="#666",
+                                    justify="left", anchor="w")
+        self.match_hint.pack(fill="x", pady=(2, 6))
+        for label in (self.match_summary, self.match_hint):
+            label.bind("<Configure>",
+                       lambda e, w=label: w.config(wraplength=max(120, e.width - 8)))
+        self.match_scroll = ScrollFrame(frame, height=360, width=560)
+        self.match_scroll.pack(fill="both", expand=True)
+        return frame
+
     def _make_tree(self, parent, columns):
         frame = ttk.Frame(parent)
         tree = ttk.Treeview(frame, columns=columns, show="headings", height=12)
@@ -659,15 +889,21 @@ class App:
         return tree
 
     # -------------------------------------------------------------- state
+    def open_db(self, db: IconDB):
+        """Adopt `db` everywhere: thresholds, views, the Match tab, and settings."""
+        self.db = db
+        self.sim_var.set(db.threshold("match_sim"))
+        self.rel_var.set(db.threshold("match_rel"))
+        self._clear_results()
+        self.refresh_db_views()
+        self.clear_detections()
+        settings.update(last_db=db.id)
+
     def choose_db(self):
         dlg = DBChooser(self.root, self.db_root, current=self.db.id if self.db else None)
         _modal(dlg)
         if dlg.result is not None:
-            self.db = dlg.result
-            self.sim_var.set(self.db.threshold("match_sim"))
-            self.rel_var.set(self.db.threshold("match_rel"))
-            self._clear_results()
-            self.refresh_db_views()
+            self.open_db(dlg.result)
             hint = t("hint.use_keys") if self.db.icons else t("hint.empty_db")
             self.set_status(t("status.opened_db", id=self.db.id,
                               count=len(self.db.icons), hint=hint))
@@ -707,6 +943,456 @@ class App:
         else:
             subprocess.Popen(["xdg-open", path])
 
+    # -------------------------------------------------------------- watch
+    def _region_text(self) -> str:
+        return self.region.label if self.region else t("watch.region_none")
+
+    def _update_region_label(self):
+        self.region_label.config(text=self._region_text())
+
+    def _sync_watch_button(self):
+        self.watch_btn.config(text=t("watch.stop") if self.watcher.running
+                              else t("watch.start"))
+
+    def _apply_topmost(self, announce: bool = True):
+        value = bool(self.topmost_var.get())
+        self.root.attributes("-topmost", value)
+        settings.update(topmost=value)
+        if announce:
+            self.set_status(t("status.topmost_on") if value else t("status.topmost_off"))
+
+    def _apply_sound(self, announce: bool = True):
+        value = bool(self.sound_var.get())
+        settings.update(watch_sound=value)
+        if announce:
+            self.set_status(t("status.sound_on") if value else t("status.sound_off"))
+
+    def _apply_autolog(self, announce: bool = True):
+        value = bool(self.autolog_var.get())
+        settings.update(watch_autolog=value)
+        if announce:
+            self.set_status(t("status.autolog_on") if value else t("status.autolog_off"))
+
+    def pick_region(self):
+        """Frame the part of the game to watch; the watcher restarts around it."""
+        was_running = self.watcher.running
+        if was_running:
+            self.stop_watch(note=False)
+        try:
+            picker = RegionPicker(self.root)
+        except Exception as exc:           # pragma: no cover - no display to cover
+            messagebox.showwarning(t("watch.region_btn"),
+                                   t("watch.picker_failed", error=exc), parent=self.root)
+            return
+        _modal(picker)
+        if picker.result is not None:
+            self.region = picker.result
+            watcher.save_region(self.region)
+            self._update_region_label()
+            self.set_status(t("status.region_picked", region=self.region.label))
+        else:
+            self.set_status(t("status.region_cancelled"))
+        if was_running:
+            self.start_watch()
+        elif picker.result is not None:
+            self.capture_now()             # show straight away what that framed
+
+    def toggle_watch(self):
+        if self.watcher.running:
+            self.stop_watch()
+        else:
+            self.start_watch()
+
+    def start_watch(self):
+        if self.db is None:
+            return
+        if self.region is None:               # the whole desktop, this window included
+            if messagebox.askyesno(t("watch.region_btn"), t("watch.no_region_body"),
+                                   parent=self.root):
+                self.pick_region()
+                if self.region is None:       # the picker was cancelled
+                    return
+        self.watcher.start(self.region)
+        self._sync_watch_button()
+        self.set_status(t("status.watching_started", region=self._region_text()))
+        if self._pump_job is None:
+            self._pump_job = self.root.after(200, self._pump)
+
+    def stop_watch(self, note: bool = True):
+        if self._pump_job is not None:
+            self.root.after_cancel(self._pump_job)
+            self._pump_job = None
+        self.watcher.stop()
+        self._sync_watch_button()
+        if note:
+            self.set_status(t("watch.stopped"))
+
+    def _pump(self):
+        """Collect what the watch thread produced and keep the loop going.
+
+        A picture that cannot be read is reported and then forgotten: an
+        exception out of a Tk callback would end the loop silently, leaving the
+        app looking as if it were still watching while it never looks again.
+        """
+        self._pump_job = None
+        frame = None
+        while True:
+            shot = self.watcher.take()
+            if shot is None:
+                break
+            frame = shot                      # only the newest frame is worth looking at
+        if frame is not None:
+            try:
+                self.process_frame(frame)
+            except Exception as exc:           # a strange picture must not kill the loop
+                self.set_status(t("watch.scan_failed", error=exc))
+        if self.watcher.error:
+            error, self.watcher.error = self.watcher.error, None
+            self.stop_watch(note=False)
+            messagebox.showwarning(t("watch.error_title"),
+                                   t("watch.error_stopped", error=error), parent=self.root)
+        elif self.watcher.running:
+            self._pump_job = self.root.after(200, self._pump)
+
+    def capture_now(self):
+        """One shot on demand - for testing a region, or catching one by hand."""
+        if self.db is None:
+            return
+        self.set_status(t("status.scanning"))
+        self.root.update_idletasks()
+        try:
+            frame = watcher.grab(self.region)
+        except watcher.CaptureError as exc:
+            messagebox.showwarning(t("watch.error_title"), str(exc), parent=self.root)
+            self.set_status(str(exc))
+            return
+        self.process_frame(frame)
+
+    def process_frame(self, frame: Image.Image):
+        """Read the picture, compare every spirit on it, and tell the player the news."""
+        if self.db is None:
+            return
+        self.set_status(t("status.scanning"))
+        self.root.update_idletasks()
+        try:
+            found = watcher.scan(self.db, frame)
+        except Exception as exc:               # a strange picture must not kill the loop
+            self.set_status(t("watch.scan_failed", error=exc))
+            return
+
+        if not found:                          # not the pick-a-spirit screen
+            self.watcher.focus_on(frame, [])
+            if self._store_the_fought(frame):
+                return
+            # the list of the last pick-a-spirit screen stays up: it is what the
+            # player still needs, and the fought one may be stored from it yet
+            self.set_status(t("status.scanned_none"))
+            self._set_verdict(t("match.no_icons"), "#e9e9e9", "#333")
+            self.root.title(t("app.title"))
+            return
+
+        self.watcher.focus_on(frame, [d.box for d in found if d.box])
+        self._keep_typed_names()               # a name may be half-typed right now
+        again = self._same_encounter(found)
+        if not again:
+            self._encounter = [d.found.tile for d in found]
+            self._names = {}
+        self._offered = [(n, d) for n, d in enumerate(found) if d.encounter]
+        self._offered_vecs = battle.offer_matrix(
+            [d.found.tile for _n, d in self._offered])
+        self.detections = found
+        self._scanned = True
+        self.render_detections()
+        self.announce(ring=not again)
+
+    def _same_encounter(self, found) -> bool:
+        """Whether these are the same spirits that were announced a moment ago.
+
+        This window sits inside the picture the watcher takes, so every repaint
+        of it - a click, a keystroke in a row - arrives as a "new" screen.  Only
+        a *different* row of spirits is worth a bell, or the same three would be
+        rung out again while the player is still deciding which to fight.
+        """
+        tiles = [d.found.tile for d in found]
+        if len(tiles) != len(self._encounter):
+            return False
+        return all(watcher.tiles_alike(a, b) for a, b in zip(tiles, self._encounter))
+
+    def _store_the_fought(self, frame: Image.Image) -> bool:
+        """Read the opponent off the battle HUD and store it, when it is clear.
+
+        The player picks one of the spirits on offer and fights it; the battle
+        HUD shows which one it is, so that one is stored without a click - unless
+        the picture is not a battle HUD, or the opponent could be either of two
+        of the spirits on offer, in which case the choice stays with the player.
+        """
+        if not self.autolog_var.get() or not self._offered:
+            return False
+        answer = battle.fought(frame, self._offered_vecs)
+        if answer is None:
+            return False
+        row, best, second = answer
+        row_index, det = self._offered[row]
+        if det.logged or det.state == watcher.PLAYED:
+            self._offered = []                 # nothing to store: already known
+            self._offered_vecs = None
+            return False
+        icon = det.record(self.db, self._names.get(row_index, ""))
+        self.session.append(icon)
+        self._offered = []
+        self._offered_vecs = None
+        self.refresh_db_views()
+        self.render_detections()
+        self._set_verdict(t("match.verdict_auto", id=icon.id), "#2471a3")
+        self.set_status(t("status.auto_stored", id=icon.id, name=icon.name,
+                          sim=best, other=second))
+        return True
+
+    def announce(self, ring: bool = True):
+        """The headline: who is new, who was already fought, and a bell for the new."""
+        total = len(self.detections)
+        fresh = [d for d in self.detections if d.state == watcher.NEW and not d.logged]
+        unsure = [d for d in self.detections if d.state == watcher.UNCLEAR and not d.logged]
+        played = [d for d in self.detections if d.state == watcher.PLAYED]
+
+        if not total:                      # not an encounter screen, just more game
+            self._set_verdict(t("match.no_icons"), "#e9e9e9", "#333")
+            self.set_status(t("status.scanned_none"))
+            self.root.title(t("app.title"))
+            return
+        self.set_status(t("status.scanned", total=total, new=len(fresh)))
+
+        if not self.db.icons:
+            self._set_verdict(t("match.verdict_empty_db"), "#b9770e")
+            self.root.title(t("app.title"))
+            return
+        if fresh:
+            nearest = fresh[0].best
+            closest = (t("match.closest_hint", id=nearest.id, sim=fresh[0].similarity)
+                       if nearest is not None else "")
+            text = (t("match.verdict_one_new", closest=closest) if len(fresh) == 1
+                    else t("match.verdict_new", count=len(fresh)))
+            self._set_verdict(text, "#c0392b")
+            # a bell is for spirits actually met, and only if it was asked for:
+            # the player is looking at the game, not at this window
+            if ring and self.sound_var.get() and any(d.encounter for d in fresh):
+                self.root.bell()
+        elif unsure:
+            self._set_verdict(t("match.verdict_unclear",
+                                ids=", ".join(d.best.id for d in unsure if d.best)),
+                              "#b9770e")
+        elif played:
+            self._set_verdict(t("match.verdict_all_played"), "#1e8449")
+        else:
+            self._set_verdict(t("idle_hint"), "#e9e9e9", "#333")
+        self.root.title(t("app.title_alert", count=len(fresh)) if fresh else t("app.title"))
+
+    # ------------------------------------------------------- match rows
+    def clear_detections(self):
+        self.detections = []
+        self.session = []
+        self._names = {}
+        self._defaults = {}
+        self._encounter = []
+        self._offered = []
+        self._offered_vecs = None
+        self._scanned = False
+        self.render_detections()
+        self.root.title(t("app.title"))
+
+    def _free_ids(self) -> list[str]:
+        """The ids the icons on screen would get if they were stored in this order.
+
+        It repeats what IconDB.add does - the lowest number above the current
+        population that is still free - so the number suggested in a row is the
+        one that row really gets when its button is clicked.
+        """
+        used = {i.id for i in self.db.icons}
+        out = []
+        for _ in self.detections:
+            n = len(used) + 1
+            while f"{n:04d}" in used:
+                n += 1
+            out.append(f"{n:04d}")
+            used.add(f"{n:04d}")
+        return out
+
+    def render_detections(self):
+        for child in self.match_scroll.inner.winfo_children():
+            child.destroy()
+        self._row_photos.clear()
+        self._row_entries = {}
+        self._defaults = {}
+        if self.db is None:
+            self.match_summary.config(text="")
+            return
+        if not self.detections:
+            ttk.Label(self.match_scroll.inner,
+                      text=t("match.empty") if not self._scanned else t("match.no_icons"),
+                      foreground="#777", padding=16).grid(row=0, column=0, sticky="w")
+            self.match_summary.config(text="")
+            return
+
+        for index, (det, suggested) in enumerate(zip(self.detections, self._free_ids())):
+            self._render_row(index, det, suggested)
+
+        fresh = sum(1 for d in self.detections if d.state == watcher.NEW and not d.logged)
+        played = sum(1 for d in self.detections if d.state == watcher.PLAYED)
+        summary = t("match.summary", total=len(self.detections), new=fresh, played=played)
+        if self.session:
+            summary += "    " + t("match.session", count=len(self.session),
+                                  names=", ".join(i.id for i in self.session[:8]))
+        self.match_summary.config(text=summary)
+
+    def _row_images(self, det) -> list[tuple[Image.Image | None, str]]:
+        """What a row shows side by side: the spirit on screen, and the closest
+        stored icon.
+
+        The pair is the whole point of a "looks similar" row: the database answer
+        is a score, and the player's answer is a glance - the more so because the
+        game prints the spirit's element badge over the portrait's lower left,
+        which costs a little similarity without meaning a different spirit.
+        """
+        pair: list[tuple[Image.Image | None, str]] = [(det.tile, t("match.thumb_screen"))]
+        if det.best is not None:
+            pair.append((det.best.tile, t("match.thumb_stored", id=det.best.id)))
+        else:
+            pair.append((None, t("match.thumb_none")))
+        return pair
+
+    def _render_row(self, index: int, det, default_name: str):
+        colour = {"new": "#c0392b", "played": "#1e8449"}.get(det.state, "#b9770e")
+        badge = t("match.state_recorded", id=det.icon.id) if det.logged else \
+            watcher.state_label(det.state)
+        if det.logged:
+            colour = "#2471a3"
+
+        row = tk.Frame(self.match_scroll.inner, bg=ROW_BG, bd=1, relief="solid",
+                       padx=6, pady=4)
+        row.grid(row=index, column=0, sticky="ew", pady=2)
+        self.match_scroll.bind_wheel(row)
+
+        # the spirit on screen and the closest icon in the database, next to each
+        # other: this pair is what a "looks similar" answer has to be judged on
+        for column, (tile, caption) in enumerate(self._row_images(det)):
+            cell = tk.Frame(row, bg=ROW_BG)
+            cell.grid(row=0, column=column, rowspan=2, padx=(0, 6))
+            self.match_scroll.bind_wheel(cell)
+            if tile is None:
+                tk.Label(cell, text="-", bg=ROW_BG, fg="#999", width=PAIR_THUMB // 8,
+                         height=3).pack()
+            else:
+                photo = _tile_photo(tile, PAIR_THUMB)
+                self._row_photos.append(photo)
+                picture = tk.Label(cell, image=photo, bd=1, relief="solid", bg=ROW_BG)
+                picture.pack()
+                self.match_scroll.bind_wheel(picture)
+                if det.best is not None:
+                    picture.bind("<Button-1>", lambda _e, d=det: self.compare(d))
+                    picture.bind("<Enter>", lambda _e, w=picture: w.config(
+                        relief="ridge", cursor="hand2"))
+                    picture.bind("<Leave>", lambda _e, w=picture: w.config(
+                        relief="solid", cursor=""))
+                    photo_ref = photo
+            tk.Label(cell, text=caption, bg=ROW_BG, fg="#777",
+                     font=(ui_font(), 8)).pack()
+            self.match_scroll.bind_wheel(cell)
+
+        # the badge sits in a fixed box: "没遇到过" and "Already fought" have to
+        # line up, and neither may be clipped to fit the other's width
+        holder = tk.Frame(row, bg=ROW_BG, width=BADGE_W, height=BADGE_H)
+        holder.grid(row=0, column=2, rowspan=2, padx=(0, 8))
+        holder.grid_propagate(False)
+        label = tk.Label(holder, text=badge, bg=colour, fg="#ffffff", justify="center",
+                         font=(ui_font(), 9, "bold"), wraplength=BADGE_W - 14)
+        label.pack(fill="both", expand=True)
+        self.match_scroll.bind_wheel(label)
+        self.match_scroll.bind_wheel(holder)
+
+        # the row is a small stack, so that everything fits a window of normal
+        # size: pictures and verdict on the left, the numbers, the name and the
+        # button stacked to the right of them
+        detail = tk.Label(row, text=self._row_detail(det), bg=ROW_BG, fg="#555",
+                          justify="left", anchor="w", wraplength=175, font=(ui_font(), 9))
+        detail.grid(row=0, column=2, sticky="w")
+        self.match_scroll.bind_wheel(detail)
+
+        if det.logged:
+            shown = det.icon.name
+        elif det.state == watcher.PLAYED and det.best is not None:
+            shown = det.best.name                 # this row *is* that stored icon
+        else:
+            shown = self._names.get(index, "") or default_name
+        entry = ttk.Entry(row, width=9)
+        entry.insert(0, shown)
+        entry.grid(row=1, column=2, sticky="ew", pady=(3, 0))
+        self._row_entries[index] = entry
+        self._defaults[index] = shown
+
+        if det.logged:
+            entry.state(["disabled"])
+            action = ttk.Button(row, text=t("match.btn_undo"),
+                                command=lambda i=index: self.undo_detection(i))
+        elif det.state == watcher.PLAYED:
+            entry.state(["disabled"])             # nothing to store: it is already there
+            action = None
+        else:
+            action = ttk.Button(row, text=t("match.btn_fight"),
+                                command=lambda i=index: self.record_detection(i))
+        if action is not None:
+            # the one button that matters: full width of the column, easy to hit
+            action.grid(row=2, column=2, sticky="ew", pady=(4, 0))
+        row.columnconfigure(2, weight=1)
+
+    def _row_detail(self, det) -> str:
+        """The row's numbers; the id already sits under the stored thumbnail."""
+        if det.best is None:
+            return t("match.detail_none")
+        return t("match.detail_row", sim=det.similarity, rel=det.confidence)
+
+    def compare(self, det):
+        """Enlarge the pair of pictures, so the verdict can be checked by eye."""
+        _modal(ReviewDialog(self.root, det))
+
+    def _keep_typed_names(self):
+        """Remember only the names the player actually typed, not the suggestions."""
+        for row_index in range(len(self.detections)):
+            typed = self._row_entries.get(row_index)
+            typed = typed.get().strip() if typed is not None else ""
+            if typed and typed != self._defaults.get(row_index):
+                self._names[row_index] = typed
+            else:
+                self._names.pop(row_index, None)
+
+    def record_detection(self, index: int):
+        """The one click: this is the one I am about to fight - store it."""
+        if self.db is None or index >= len(self.detections):
+            return
+        det = self.detections[index]
+        if det.logged:
+            return
+        self._keep_typed_names()
+        # an untouched name is only a suggestion of the next id: hand the icon
+        # over unnamed and let the database call it by the id it really gets
+        icon = det.record(self.db, self._names.get(index, ""))
+        self.session.append(icon)
+        self.refresh_db_views()
+        self.render_detections()
+        self.set_status(t("match.saved", id=icon.id, name=icon.name))
+
+    def undo_detection(self, index: int):
+        if self.db is None or index >= len(self.detections):
+            return
+        det = self.detections[index]
+        if not det.logged:
+            return
+        icon_id = det.icon.id
+        det.unrecord(self.db)
+        self.session = [i for i in self.session if i.id != icon_id]
+        self.refresh_db_views()
+        self.render_detections()
+        self.set_status(t("match.undone", id=icon_id))
+
     # ------------------------------------------------------------ display
     def _clear_results(self):
         self.query_tile = None
@@ -745,7 +1431,7 @@ class App:
             self.cand_tree.insert("", "end", iid=icon.id,
                                   values=(rank, f"{icon.id}  {icon.name}", f"{score:.3f}"))
         if results:
-            self.tabs.select(0)
+            self.tabs.select(self.cand_tree.master)
             self.cand_tree.selection_set(results[0][0].id)
 
     def _on_candidate_select(self, _event=None):
@@ -765,7 +1451,8 @@ class App:
                 self._show_match(icon, None)
 
     def _selected_icon(self):
-        tree = self.all_tree if self.tabs.index("current") == 1 else self.cand_tree
+        tree = (self.all_tree if self.tabs.index("current") == self.tabs.index(self.all_tree.master)
+                else self.cand_tree)
         sel = tree.selection()
         return self.db.get(sel[0]) if (sel and self.db) else None
 
@@ -941,6 +1628,13 @@ def main(db_root: Path = DEFAULT_ROOT, lang: str | None = None):
         i18n.save_language(lang)
     else:
         i18n.load_language()
+    # before Tk exists: the watcher captures physical pixels, and the window has
+    # to agree with it about where the mouse is on a scaled display
+    dpi = watcher.enable_dpi_awareness()
     root = tk.Tk()
+    try:
+        root.tk.call("tk", "scaling", dpi / 72.0)
+    except tk.TclError:                            # pragma: no cover - exotic Tk
+        pass
     App(root, db_root)
     root.mainloop()
